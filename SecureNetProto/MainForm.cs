@@ -1,26 +1,50 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Timers;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Timers;
+using System.Windows.Forms;
+using STUN;                          // moien007’s STUN library
+using Microsoft.VisualBasic;        // for Interaction.InputBox
 
 namespace SecureNetProto
 {
     public partial class MainForm : Form
     {
-        const string USERNAME_FILE = "Data\\username.txt";
-        const int BROADCAST_PORT = 37000;
-        const int FILE_TRANSFER_PORT = 38000;
-        const int BROADCAST_INTERVAL = 1000; // milliseconds
+        // ───────────── Fields & Constants ─────────────
 
-        UdpClient udpBroadcaster;
-        UdpClient udpListener;
-        System.Timers.Timer broadcastTimer;
-        HashSet<string> onlinePeers = new HashSet<string>();
-        string currentIdentifier = "";
-        List<SharedFileInfo> mySharedFiles = new List<SharedFileInfo>();
-        Dictionary<string, List<SharedFileInfo>> remoteFiles = new Dictionary<string, List<SharedFileInfo>>();
+        private string startupUsername = "";
+        private CancellationTokenSource connectingCts;
+
+        private const string USERNAME_FILE = "Data\\username.txt";
+        private const int BROADCAST_PORT = 37000;
+        private const int FILE_TRANSFER_PORT = 38000;
+        private const int BROADCAST_INTERVAL = 1000; // milliseconds
+
+        private UdpClient udpBroadcaster;
+        private UdpClient udpListener;
+        private System.Timers.Timer broadcastTimer;
+
+        private HashSet<string> onlinePeers = new HashSet<string>();
+        private string currentIdentifier = "";
+
+        private List<SharedFileInfo> mySharedFiles = new List<SharedFileInfo>();
+        private Dictionary<string, List<SharedFileInfo>> remoteFiles = new Dictionary<string, List<SharedFileInfo>>();
         private Dictionary<int, (string Owner, string FileName)> contentIndex = new();
+
+        // ─── New NAT‐Traversal Fields ───
+        private IPEndPoint publicEndpoint;        // our discovered external IP:port
+        private IPEndPoint remotePublicEndpoint;  // other peer’s public IP:port
+        private bool isHolePunching = false;
+
+        // ───────────── Constructor ─────────────
 
         public MainForm()
         {
@@ -29,104 +53,353 @@ namespace SecureNetProto
             Directory.CreateDirectory("Data\\Chunks");
             LoadUsername();
 
-            // Focus username box on load
-            this.Shown += (s, e) => {
-                if (string.IsNullOrWhiteSpace(txtUsername.Text))
-                    txtUsername.Focus();
-                else
+            // Focus logic on first Show
+            this.Shown += (s, e) =>
+            {
+                if (panelStartup.Visible)
+                {
+                    if (string.IsNullOrWhiteSpace(txtStartupUsername.Text))
+                        txtStartupUsername.Focus();
+                    else
+                        btnStartupConnect.Focus();
+                }
+                else if (panelMain.Visible)
+                {
                     btnShare.Focus();
+                }
             };
 
-            // Optional: Alternate row color for ListBox
+            // Alternate‐row coloring for ListBox
             lstContent.DrawMode = DrawMode.OwnerDrawFixed;
-            lstContent.DrawItem += (s, e) => {
+            lstContent.DrawItem += (s, e) =>
+            {
                 if (e.Index < 0) return;
-                var bg = (e.Index % 2 == 0) ? Color.FromArgb(60, 66, 90) : Color.FromArgb(50, 56, 74);
+                var bg = (e.Index % 2 == 0)
+                    ? Color.FromArgb(60, 66, 90)
+                    : Color.FromArgb(50, 56, 74);
                 e.Graphics.FillRectangle(new SolidBrush(bg), e.Bounds);
-                e.Graphics.DrawString(lstContent.Items[e.Index].ToString(),
-                    e.Font, Brushes.WhiteSmoke, e.Bounds.Left, e.Bounds.Top + 1);
+                e.Graphics.DrawString(
+                    lstContent.Items[e.Index].ToString(),
+                    e.Font,
+                    Brushes.WhiteSmoke,
+                    e.Bounds.Left,
+                    e.Bounds.Top + 1
+                );
                 e.DrawFocusRectangle();
             };
 
-            // Optional: Tooltip on files
+            // Tooltip on files
             var tip = new ToolTip();
-            lstContent.MouseMove += (s, e) => {
+            lstContent.MouseMove += (s, e) =>
+            {
                 int idx = lstContent.IndexFromPoint(e.Location);
                 if (idx >= 0 && idx < lstContent.Items.Count)
                     tip.SetToolTip(lstContent, lstContent.Items[idx].ToString());
             };
+
+            // Panels at start
+            panelStartup.Visible = true;
+            panelConnecting.Visible = false;
+            panelMain.Visible = false;
+
+            // AcceptButton initially = btnStartupConnect
+            this.AcceptButton = btnStartupConnect;
+
+            // Startup events
+            txtStartupUsername.TextChanged += txtStartupUsername_TextChanged;
+            btnStartupConnect.Click += btnStartupConnect_Click;
         }
 
+        // ───────────── Username / Startup Logic ─────────────
 
-        // --------- Username Storage ---------
-        private void LoadUsername()
+        private void txtStartupUsername_TextChanged(object sender, EventArgs e)
         {
-            if (File.Exists(USERNAME_FILE))
+            var valid = !string.IsNullOrWhiteSpace(txtStartupUsername.Text)
+                        && txtStartupUsername.Text.Trim().Length >= 3;
+            btnStartupConnect.Enabled = valid;
+        }
+
+        private async void btnStartupConnect_Click(object sender, EventArgs e)
+        {
+            startupUsername = txtStartupUsername.Text.Trim();
+
+            panelStartup.Visible = false;
+            panelConnecting.Visible = true;
+            panelMain.Visible = false;
+            txtConnectingLog.Clear();
+            lblConnecting.Text = "Connecting…";
+            connectingCts = new CancellationTokenSource();
+
+            try
             {
-                txtUsername.Text = File.ReadAllText(USERNAME_FILE);
+                await ConnectFlow(connectingCts.Token);
+
+                // Success → show Main panel
+                panelConnecting.Visible = false;
+                panelMain.Visible = true;
+                InitializeMainPanelAfterConnect();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[DEBUG] {DateTime.Now:HH:mm:ss}  ConnectFlow failed: {ex.GetType().Name}: {ex.Message}");
+                txtConnectingLog.AppendText(Environment.NewLine + $"Error: {ex.Message}");
+                txtConnectingLog.ForeColor = Color.LightPink;
+                lblConnecting.Text = "Connection Failed";
+
+                await Task.Delay(2500);
+                panelConnecting.Visible = false;
+                panelStartup.Visible = true;
             }
         }
 
-        private void SaveUsername()
+        private async Task ConnectFlow(CancellationToken ct)
         {
-            Directory.CreateDirectory("Data");
-            File.WriteAllText(USERNAME_FILE, txtUsername.Text.Trim());
-        }
-
-        private string GetLocalIdentifier()
-        {
-            // "username_MachineName"
-            return $"{txtUsername.Text.Trim()}_{Environment.MachineName}";
-        }
-
-        // --------- Connection Logic ---------
-        private void btnConnect_Click(object sender, EventArgs e)
-        {
-            string username = txtUsername.Text.Trim();
-            if (string.IsNullOrWhiteSpace(username))
+            Action<string> log = msg => Invoke(new Action(() =>
             {
-                MessageBox.Show("Please enter a username.", "Info", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                txtConnectingLog.AppendText(msg + Environment.NewLine);
+            }));
+
+            // 1) Validate username
+            try
+            {
+                log("Validating username...");
+                await Task.Delay(400, ct);
+                if (startupUsername.Length < 3)
+                    throw new Exception("Username too short.");
+            }
+            catch (Exception ex)
+            {
+                log($"[ERROR] {ex.Message}");
                 return;
             }
-            SaveUsername();
-            currentIdentifier = GetLocalIdentifier();
-            btnConnect.Enabled = false;
-            txtUsername.Enabled = false;
+
+            // 2) Save username to disk
+            try
+            {
+                log("Saving username...");
+                await Task.Delay(350, ct);
+                Directory.CreateDirectory("Data");
+                File.WriteAllText(USERNAME_FILE, startupUsername);
+            }
+            catch (Exception ex)
+            {
+                log($"[ERROR] Failed to write username file: {ex.Message}");
+                return;
+            }
+
+            // 3) Initialize network (placeholder for any setup)
+            try
+            {
+                log("Initializing network...");
+                await Task.Delay(500, ct);
+            }
+            catch (Exception ex)
+            {
+                log($"[ERROR] Network init failed: {ex.Message}");
+                return;
+            }
+
+            // ─── Attempt LAN discovery first ───
+            try
+            {
+                log("Broadcasting presence (LAN)...");
+                StartBroadcasting();
+                StartListening();
+                await Task.Delay(2000, ct); // wait to see if any LAN peers appear
+            }
+            catch (Exception ex)
+            {
+                log($"[ERROR] LAN broadcast error: {ex.Message}");
+            }
+
+            if (onlinePeers.Count > 0)
+            {
+                log($"Found {onlinePeers.Count} peer(s) on the same LAN.");
+                log("Ready!");
+                return;
+            }
+
+            // ─── No LAN peers → do NAT traversal ───
+            log("No LAN peers. Switching to NAT traversal…");
+
+            try
+            {
+                // 4a) Discover our public endpoint via STUN
+                log("Discovering public endpoint via STUN...");
+                publicEndpoint = DiscoverPublicEndpoint();
+                log($"Your public endpoint: {publicEndpoint.Address}:{publicEndpoint.Port}");
+
+                // Copy to clipboard for manual exchange
+                Clipboard.SetText($"{publicEndpoint.Address}:{publicEndpoint.Port}");
+                log("Public endpoint copied to clipboard. Share it with your peer.");
+
+                // 4b) Prompt user to enter remote peer’s endpoint
+                string input = "";
+                Invoke(new Action(() =>
+                {
+                    input = Interaction.InputBox(
+                        "Enter the other peer’s public endpoint (IP:Port), e.g. 203.0.113.78:47659",
+                        "Remote Peer Info"
+                    );
+                }));
+
+                if (string.IsNullOrWhiteSpace(input))
+                {
+                    log("[ERROR] No remote endpoint provided.");
+                    return;
+                }
+
+                var parts = input.Trim().Split(':');
+                if (parts.Length != 2 ||
+                    !IPAddress.TryParse(parts[0], out var remoteIP) ||
+                    !int.TryParse(parts[1], out var remotePort))
+                {
+                    log("[ERROR] Invalid endpoint format.");
+                    return;
+                }
+                remotePublicEndpoint = new IPEndPoint(remoteIP, remotePort);
+
+                // 4c) Perform UDP hole‐punching
+                log($"Punching UDP to {remotePublicEndpoint.Address}:{remotePublicEndpoint.Port}…");
+
+                isHolePunching = true;
+                using (var puncher = new UdpClient(new IPEndPoint(IPAddress.Any, publicEndpoint.Port)))
+                {
+                    // Listener task to catch remote “HELLO!”
+                    var ctsListen = new CancellationTokenSource();
+                    Task.Run(() =>
+                    {
+                        var listener = new UdpClient(publicEndpoint.Port);
+                        while (isHolePunching)
+                        {
+                            try
+                            {
+                                IPEndPoint ep = null!;
+                                var data = listener.Receive(ref ep);
+                                string txt = Encoding.UTF8.GetString(data);
+                                if (txt == "HELLO!")
+                                {
+                                    lock (onlinePeers)
+                                    {
+                                        onlinePeers.Add($"{startupUsername}_{ep.Address}");
+                                    }
+                                    Invoke(new Action(UpdateOnlineCount));
+                                    break;
+                                }
+                            }
+                            catch
+                            {
+                                // Ignore and keep waiting
+                            }
+                        }
+                        listener.Close();
+                        ctsListen.Cancel();
+                    }, ctsListen.Token);
+
+                    // Send “HELLO!” packets for up to 5 seconds
+                    var sw = Stopwatch.StartNew();
+                    while (sw.Elapsed < TimeSpan.FromSeconds(5) && !ctsListen.Token.IsCancellationRequested)
+                    {
+                        var hello = Encoding.UTF8.GetBytes("HELLO!");
+                        puncher.Send(hello, hello.Length, remotePublicEndpoint);
+                        await Task.Delay(200, ct);
+                    }
+                    isHolePunching = false;
+                }
+
+                if (onlinePeers.Count > 0)
+                {
+                    log("NAT hole‐punch succeeded—peer is online!");
+                }
+                else
+                {
+                    log("[ERROR] Hole‐punching failed. Check NAT/firewall settings.");
+                }
+            }
+            catch (Exception ex)
+            {
+                log($"[ERROR] NAT traversal error: {ex.Message}");
+                return;
+            }
+
+            log("Ready!");
+        }
+
+        // ───────────── Initialize Main Panel ─────────────
+
+        private void InitializeMainPanelAfterConnect()
+        {
+            lblAppTitle.Text = "SecureNet 🕸️";
+            lblSubtitle.Text = "Connect. Share. Stay private. Prototype Edition.";
+            lblUsername.Text = $"Username: {startupUsername}";
+            lblUsersOnline.Text = $"Users online: {onlinePeers.Count + 1}";
+
+            panelMain.Visible = true;
+            this.AcceptButton = btnShare;
 
             StartBroadcasting();
             StartListening();
             StartFileServer();
             BroadcastMyFiles();
-
-            BroadcastMyFiles(); // Broadcast your shared files at connect
         }
 
-        // --------- Broadcasting Presence & Files ---------
+        // ───────────── Username Storage ─────────────
+
+        private void LoadUsername()
+        {
+            if (File.Exists(USERNAME_FILE))
+            {
+                startupUsername = File.ReadAllText(USERNAME_FILE).Trim();
+                txtStartupUsername.Text = startupUsername;
+                if (startupUsername.Length >= 3)
+                    btnStartupConnect.Enabled = true;
+            }
+        }
+
+        private string GetLocalIdentifier()
+        {
+            return $"{startupUsername}_{Environment.MachineName}";
+        }
+
+        // ───────────── Broadcasting Presence & Files ─────────────
+
         private void StartBroadcasting()
         {
+            if (udpBroadcaster != null)
+                return;
+
             udpBroadcaster = new UdpClient();
             broadcastTimer = new System.Timers.Timer(BROADCAST_INTERVAL);
-            broadcastTimer.Elapsed += (s, e) =>
-            {
-                try
-                {
-                    // Presence
-                    string msg = currentIdentifier;
-                    byte[] data = Encoding.UTF8.GetBytes(msg);
-                    udpBroadcaster.EnableBroadcast = true;
-                    udpBroadcaster.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, BROADCAST_PORT));
-
-                    // Files (broadcast every 5th tick)
-                    if (DateTime.Now.Second % 5 == 0)
-                        BroadcastMyFiles();
-                }
-                catch { /* Ignore errors */ }
-            };
+            broadcastTimer.Elapsed += BroadcastTimer_Elapsed;
             broadcastTimer.Start();
+        }
+
+        private void BroadcastTimer_Elapsed(object? sender, ElapsedEventArgs e)
+        {
+            if (udpBroadcaster == null)
+                return;
+
+            try
+            {
+                string msg = GetLocalIdentifier();
+                byte[] data = Encoding.UTF8.GetBytes(msg);
+                udpBroadcaster.EnableBroadcast = true;
+                udpBroadcaster.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, BROADCAST_PORT));
+
+                if (DateTime.Now.Second % 5 == 0)
+                    BroadcastMyFiles();
+            }
+            catch
+            {
+                // ignore
+            }
         }
 
         private void BroadcastMyFiles()
         {
+            if (udpBroadcaster == null)
+                return;
+
             try
             {
                 var payload = JsonSerializer.Serialize(mySharedFiles);
@@ -134,14 +407,19 @@ namespace SecureNetProto
                 byte[] data = Encoding.UTF8.GetBytes(msg);
                 udpBroadcaster.Send(data, data.Length, new IPEndPoint(IPAddress.Broadcast, BROADCAST_PORT));
             }
-            catch { /* Ignore errors */ }
+            catch { }
         }
 
-        // --------- Listening for Peers & Files ---------
+        // ───────────── Listening for Peers & Files ─────────────
+
         private void StartListening()
         {
+            if (udpListener != null)
+                return;
+
             udpListener = new UdpClient(BROADCAST_PORT);
             udpListener.EnableBroadcast = true;
+
             Task.Run(() =>
             {
                 while (true)
@@ -152,24 +430,23 @@ namespace SecureNetProto
                         var data = udpListener.Receive(ref ep);
                         string message = Encoding.UTF8.GetString(data);
 
-                        // Is it a file broadcast?
                         if (message.StartsWith("files:"))
                         {
-                            // Parse: files:sender_id:json_payload
                             var parts = message.Split(':', 3);
                             if (parts.Length == 3)
                             {
                                 string sender = parts[1];
-                                if (sender == currentIdentifier) continue; // Don't process own files
+                                if (sender == GetLocalIdentifier())
+                                    continue;
+
                                 var files = JsonSerializer.Deserialize<List<SharedFileInfo>>(parts[2]);
                                 UpdateRemoteFiles(sender, files);
                             }
                         }
                         else
                         {
-                            // Peer presence
                             string id = message;
-                            if (id == currentIdentifier)
+                            if (id == GetLocalIdentifier())
                                 continue;
 
                             lock (onlinePeers)
@@ -181,7 +458,10 @@ namespace SecureNetProto
                             }
                         }
                     }
-                    catch { /* Ignore errors */ }
+                    catch
+                    {
+                        // ignore
+                    }
                 }
             });
         }
@@ -206,18 +486,22 @@ namespace SecureNetProto
             lstContent.Items.Clear();
             contentIndex.Clear();
             int idx = 0;
-            // Show your files
+
             foreach (var f in mySharedFiles)
             {
-                lstContent.Items.Add($"{f.FileName} ({f.FileSize / 1024} KB) | {f.TotalChunks} chunks | By: {f.Owner} (You)");
+                lstContent.Items.Add(
+                    $"{f.FileName} ({f.FileSize / 1024} KB) | {f.TotalChunks} chunks | By: {f.Owner} (You)"
+                );
                 contentIndex[idx++] = (GetLocalIdentifier(), f.FileName);
             }
-            // Show remote files
+
             foreach (var remote in remoteFiles)
             {
                 foreach (var f in remote.Value)
                 {
-                    lstContent.Items.Add($"{f.FileName} ({f.FileSize / 1024} KB) | {f.TotalChunks} chunks | By: {f.Owner}");
+                    lstContent.Items.Add(
+                        $"{f.FileName} ({f.FileSize / 1024} KB) | {f.TotalChunks} chunks | By: {f.Owner}"
+                    );
                     contentIndex[idx++] = (remote.Key, f.FileName);
                 }
             }
@@ -230,10 +514,12 @@ namespace SecureNetProto
                 Invoke(new Action(UpdateOnlineCount));
                 return;
             }
+
             lblUsersOnline.Text = $"Users online: {onlinePeers.Count + 1}";
         }
 
-        // --------- File Sharing ---------
+        // ───────────── File Sharing ─────────────
+
         private void btnShare_Click(object sender, EventArgs e)
         {
             using (OpenFileDialog ofd = new OpenFileDialog())
@@ -244,7 +530,6 @@ namespace SecureNetProto
                     string fileName = Path.GetFileName(filePath);
                     long fileSize = new FileInfo(filePath).Length;
 
-                    // Chunk file into 256KB pieces
                     byte[] allBytes = File.ReadAllBytes(filePath);
                     int chunkSize = 256 * 1024;
                     int totalChunks = (int)Math.Ceiling((double)allBytes.Length / chunkSize);
@@ -253,18 +538,26 @@ namespace SecureNetProto
                     {
                         string chunkFile = $"Data\\Chunks\\{fileName}_chunk{i}";
                         int actualSize = Math.Min(chunkSize, allBytes.Length - i * chunkSize);
-                        File.WriteAllBytes(chunkFile, allBytes.Skip(i * chunkSize).Take(actualSize).ToArray());
+                        File.WriteAllBytes(
+                            chunkFile,
+                            allBytes.Skip(i * chunkSize).Take(actualSize).ToArray()
+                        );
                     }
 
                     mySharedFiles.Add(new SharedFileInfo
                     {
-                        Owner = txtUsername.Text,
+                        Owner = startupUsername,
                         FileName = fileName,
                         FileSize = fileSize,
                         TotalChunks = totalChunks
                     });
 
-                    MessageBox.Show($"File chunked into {totalChunks} pieces.", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show(
+                        $"File chunked into {totalChunks} pieces.",
+                        "Success",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
 
                     UpdateContentList();
                     BroadcastMyFiles();
@@ -272,7 +565,8 @@ namespace SecureNetProto
             }
         }
 
-        // --------- Clean up UDP sockets on close ---------
+        // ───────────── Clean up on Form Closing ─────────────
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             try
@@ -285,8 +579,14 @@ namespace SecureNetProto
             base.OnFormClosing(e);
         }
 
+        private bool fileServerStarted = false;
+
         private void StartFileServer()
         {
+            if (fileServerStarted)
+                return;
+
+            fileServerStarted = true;
             Task.Run(() =>
             {
                 TcpListener listener = new TcpListener(IPAddress.Any, FILE_TRANSFER_PORT);
@@ -298,7 +598,10 @@ namespace SecureNetProto
                         var client = listener.AcceptTcpClient();
                         Task.Run(() => HandleFileRequest(client));
                     }
-                    catch { break; }
+                    catch
+                    {
+                        break;
+                    }
                 }
                 listener.Stop();
             });
@@ -308,35 +611,35 @@ namespace SecureNetProto
         {
             try
             {
-                using (var ns = client.GetStream())
+                using var ns = client.GetStream();
+
+                byte[] lenBuf = new byte[4];
+                ns.Read(lenBuf, 0, 4);
+                int nameLen = BitConverter.ToInt32(lenBuf, 0);
+                byte[] nameBuf = new byte[nameLen];
+                ns.Read(nameBuf, 0, nameLen);
+                string reqFile = Encoding.UTF8.GetString(nameBuf);
+
+                int chunkNum = 0;
+                while (true)
                 {
-                    // Receive the file name
-                    byte[] lenBuf = new byte[4];
-                    ns.Read(lenBuf, 0, 4);
-                    int nameLen = BitConverter.ToInt32(lenBuf, 0);
-                    byte[] nameBuf = new byte[nameLen];
-                    ns.Read(nameBuf, 0, nameLen);
-                    string reqFile = Encoding.UTF8.GetString(nameBuf);
+                    string chunkFile = $"Data\\Chunks\\{reqFile}_chunk{chunkNum}";
+                    if (!File.Exists(chunkFile))
+                        break;
 
-                    // Send all chunks (in chunk order)
-                    int chunkNum = 0;
-                    while (true)
-                    {
-                        string chunkFile = $"Data\\Chunks\\{reqFile}_chunk{chunkNum}";
-                        if (!File.Exists(chunkFile))
-                            break;
-
-                        byte[] chunk = File.ReadAllBytes(chunkFile);
-                        ns.Write(BitConverter.GetBytes(chunk.Length), 0, 4); // send chunk size
-                        ns.Write(chunk, 0, chunk.Length);
-                        chunkNum++;
-                    }
-                    // Send zero to signal end
-                    ns.Write(BitConverter.GetBytes(0), 0, 4);
+                    byte[] chunk = File.ReadAllBytes(chunkFile);
+                    ns.Write(BitConverter.GetBytes(chunk.Length), 0, 4);
+                    ns.Write(chunk, 0, chunk.Length);
+                    chunkNum++;
                 }
+
+                ns.Write(BitConverter.GetBytes(0), 0, 4);
             }
             catch { }
-            finally { client.Close(); }
+            finally
+            {
+                client.Close();
+            }
         }
 
         private void lstContent_DoubleClick(object sender, EventArgs e)
@@ -346,11 +649,9 @@ namespace SecureNetProto
 
             var (owner, fileName) = contentIndex[lstContent.SelectedIndex];
 
-            // If it's your own file, do nothing
             if (owner == GetLocalIdentifier())
                 return;
 
-            // Find the IP of the owner (hack: extract from UDP peer list)
             string? ownerIP = null;
             lock (onlinePeers)
             {
@@ -358,13 +659,13 @@ namespace SecureNetProto
                 {
                     if (peer == owner || peer.StartsWith(owner))
                     {
-                        // peer is like "username_MachineName"
-                        // Try to resolve host to IP
                         var host = peer.Split('_').Last();
                         try
                         {
                             var entry = Dns.GetHostEntry(host);
-                            ownerIP = entry.AddressList.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)?.ToString();
+                            ownerIP = entry.AddressList
+                                .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)
+                                ?.ToString();
                             if (ownerIP != null)
                                 break;
                         }
@@ -372,61 +673,96 @@ namespace SecureNetProto
                     }
                 }
             }
+
             if (ownerIP == null)
             {
                 MessageBox.Show("Peer not found or offline.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
-            // Download file!
             Task.Run(() =>
             {
                 try
                 {
-                    using (var client = new TcpClient())
+                    using var client = new TcpClient();
+                    client.Connect(ownerIP, FILE_TRANSFER_PORT);
+                    using var ns = client.GetStream();
+
+                    byte[] nameBytes = Encoding.UTF8.GetBytes(fileName);
+                    ns.Write(BitConverter.GetBytes(nameBytes.Length), 0, 4);
+                    ns.Write(nameBytes, 0, nameBytes.Length);
+
+                    Directory.CreateDirectory("Downloads");
+                    string outputPath = Path.Combine("Downloads", fileName);
+
+                    using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write);
+                    while (true)
                     {
-                        client.Connect(ownerIP, FILE_TRANSFER_PORT);
-                        using (var ns = client.GetStream())
+                        byte[] lenBuf = new byte[4];
+                        int read = ns.Read(lenBuf, 0, 4);
+                        if (read < 4)
+                            break;
+
+                        int chunkLen = BitConverter.ToInt32(lenBuf, 0);
+                        if (chunkLen == 0)
+                            break;
+
+                        byte[] chunk = new byte[chunkLen];
+                        int received = 0;
+                        while (received < chunkLen)
                         {
-                            byte[] nameBytes = Encoding.UTF8.GetBytes(fileName);
-                            ns.Write(BitConverter.GetBytes(nameBytes.Length), 0, 4);
-                            ns.Write(nameBytes, 0, nameBytes.Length);
-
-                            // Receive chunks and assemble
-                            Directory.CreateDirectory("Downloads");
-                            using (var fs = new FileStream($"Downloads\\{fileName}", FileMode.Create, FileAccess.Write))
-                            {
-                                while (true)
-                                {
-                                    byte[] lenBuf = new byte[4];
-                                    int read = ns.Read(lenBuf, 0, 4);
-                                    if (read < 4)
-                                        break;
-                                    int chunkLen = BitConverter.ToInt32(lenBuf, 0);
-                                    if (chunkLen == 0)
-                                        break;
-
-                                    byte[] chunk = new byte[chunkLen];
-                                    int received = 0;
-                                    while (received < chunkLen)
-                                    {
-                                        int r = ns.Read(chunk, received, chunkLen - received);
-                                        if (r <= 0) break;
-                                        received += r;
-                                    }
-                                    fs.Write(chunk, 0, chunkLen);
-                                }
-                            }
+                            int r = ns.Read(chunk, received, chunkLen - received);
+                            if (r <= 0)
+                                break;
+                            received += r;
                         }
+                        fs.Write(chunk, 0, chunkLen);
                     }
-                    MessageBox.Show($"Downloaded to Downloads\\{fileName}!", "Download Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 catch
                 {
-                    MessageBox.Show("Download failed.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    Invoke(new Action(() =>
+                    {
+                        MessageBox.Show("Download failed.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }));
+                    return;
                 }
+
+                Invoke(new Action(() =>
+                {
+                    MessageBox.Show($"Downloaded to Downloads\\{fileName}!", "Download Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }));
             });
         }
 
+        // ───────────── Helper: STUN Discovery ─────────────
+
+        private IPEndPoint DiscoverPublicEndpoint()
+        {
+            // 1) Bind a raw UDP socket to an ephemeral local port (NAT will assign a public port)
+            using var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            sock.Bind(new IPEndPoint(IPAddress.Any, 0));
+
+            // 2) Resolve a STUN server hostname (Google’s public STUN on port 19302)
+            var stunServerIPs = Dns.GetHostEntry("stun.l.google.com")
+                                   .AddressList
+                                   .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork)
+                                   .ToList();
+            if (!stunServerIPs.Any())
+                throw new Exception("Could not resolve STUN server host.");
+
+            var stunServerEP = new IPEndPoint(stunServerIPs.First(), 19302);
+
+            // 3) Query the STUN server. 
+            //    STUNClient.Query(IPEndPoint server, STUNQueryType type, bool randomize) 
+            //    returns a STUNQueryResult, whose PublicEndPoint is the mapped (public) IP:port.
+            STUNQueryResult result = STUNClient.Query(stunServerEP, STUNQueryType.OpenNAT, true);
+
+            if (result == null || result.PublicEndPoint == null)
+                throw new Exception("STUN discovery failed (no response or NAT blocked).");
+
+            // 4) Return the discovered public endpoint (IP:port)
+            return result.PublicEndPoint;
+        }
     }
 }
