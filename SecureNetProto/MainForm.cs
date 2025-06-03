@@ -43,6 +43,7 @@ namespace SecureNetProto
         private IPEndPoint publicEndpoint;        // our discovered external IP:port
         private IPEndPoint remotePublicEndpoint;  // other peer’s public IP:port
         private bool isHolePunching = false;
+        private bool natTraversalDone = false;
 
         // ───────────── Constructor ─────────────
 
@@ -121,30 +122,39 @@ namespace SecureNetProto
 
         private async void btnStartupConnect_Click(object sender, EventArgs e)
         {
+            // 1) Read & store the username
             startupUsername = txtStartupUsername.Text.Trim();
 
+            // 2) Flip to the “Connecting…” UI
             panelStartup.Visible = false;
             panelConnecting.Visible = true;
             panelMain.Visible = false;
             txtConnectingLog.Clear();
             lblConnecting.Text = "Connecting…";
+
+            // 3) Initialize the CTS here (so it's never null)
             connectingCts = new CancellationTokenSource();
+            natTraversalDone = false;
 
             try
             {
                 await ConnectFlow(connectingCts.Token);
 
-                // Success → show Main panel
+                // 4) Only after ConnectFlow returns (including after the InputBox)
                 panelConnecting.Visible = false;
                 panelMain.Visible = true;
                 InitializeMainPanelAfterConnect();
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[DEBUG] {DateTime.Now:HH:mm:ss}  ConnectFlow failed: {ex.GetType().Name}: {ex.Message}");
-                txtConnectingLog.AppendText(Environment.NewLine + $"Error: {ex.Message}");
+                Debug.WriteLine($"[CONNECT ERROR] {ex}");
+                txtConnectingLog.AppendText(Environment.NewLine
+                    + $"⛔ Exception: {ex.GetType().Name}: {ex.Message}{Environment.NewLine}"
+                    + ex.StackTrace);
                 txtConnectingLog.ForeColor = Color.LightPink;
                 lblConnecting.Text = "Connection Failed";
+
+                MessageBox.Show(ex.ToString(), "ConnectFlow Exception", MessageBoxButtons.OK, MessageBoxIcon.Error);
 
                 await Task.Delay(2500);
                 panelConnecting.Visible = false;
@@ -187,7 +197,7 @@ namespace SecureNetProto
                 return;
             }
 
-            // 3) Initialize network (placeholder for any setup)
+            // 3) Initialize network (placeholder)
             try
             {
                 log("Initializing network...");
@@ -199,13 +209,13 @@ namespace SecureNetProto
                 return;
             }
 
-            // ─── Attempt LAN discovery first ───
+            // ── Attempt LAN discovery first ──
             try
             {
                 log("Broadcasting presence (LAN)...");
                 StartBroadcasting();
                 StartListening();
-                await Task.Delay(2000, ct); // wait to see if any LAN peers appear
+                await Task.Delay(2000, ct);
             }
             catch (Exception ex)
             {
@@ -219,107 +229,115 @@ namespace SecureNetProto
                 return;
             }
 
-            // ─── No LAN peers → do NAT traversal ───
-            log("No LAN peers. Switching to NAT traversal…");
-
-            try
+            // ── No LAN peers → do NAT traversal, but only once ──
+            if (!natTraversalDone)
             {
-                // 4a) Discover our public endpoint via STUN
-                log("Discovering public endpoint via STUN...");
-                publicEndpoint = DiscoverPublicEndpoint();
-                log($"Your public endpoint: {publicEndpoint.Address}:{publicEndpoint.Port}");
+                natTraversalDone = true;
+                log("No LAN peers. Switching to NAT traversal…");
 
-                // Copy to clipboard for manual exchange
-                Clipboard.SetText($"{publicEndpoint.Address}:{publicEndpoint.Port}");
-                log("Public endpoint copied to clipboard. Share it with your peer.");
-
-                // 4b) Prompt user to enter remote peer’s endpoint
-                string input = "";
-                Invoke(new Action(() =>
+                try
                 {
-                    input = Interaction.InputBox(
-                        "Enter the other peer’s public endpoint (IP:Port), e.g. 203.0.113.78:47659",
-                        "Remote Peer Info"
-                    );
-                }));
+                    // 4a) Discover public endpoint via STUN
+                    log("Discovering public endpoint via STUN...");
+                    publicEndpoint = DiscoverPublicEndpoint();
+                    log($"Your public endpoint: {publicEndpoint.Address}:{publicEndpoint.Port}");
 
-                if (string.IsNullOrWhiteSpace(input))
-                {
-                    log("[ERROR] No remote endpoint provided.");
-                    return;
-                }
+                    // Copy to clipboard
+                    Clipboard.SetText($"{publicEndpoint.Address}:{publicEndpoint.Port}");
+                    log("Public endpoint copied to clipboard. Share it with your peer.");
 
-                var parts = input.Trim().Split(':');
-                if (parts.Length != 2 ||
-                    !IPAddress.TryParse(parts[0], out var remoteIP) ||
-                    !int.TryParse(parts[1], out var remotePort))
-                {
-                    log("[ERROR] Invalid endpoint format.");
-                    return;
-                }
-                remotePublicEndpoint = new IPEndPoint(remoteIP, remotePort);
-
-                // 4c) Perform UDP hole‐punching
-                log($"Punching UDP to {remotePublicEndpoint.Address}:{remotePublicEndpoint.Port}…");
-
-                isHolePunching = true;
-                using (var puncher = new UdpClient(new IPEndPoint(IPAddress.Any, publicEndpoint.Port)))
-                {
-                    // Listener task to catch remote “HELLO!”
-                    var ctsListen = new CancellationTokenSource();
-                    Task.Run(() =>
+                    // 4b) Prompt user for remote peer’s endpoint
+                    string input = "";
+                    Invoke(new Action(() =>
                     {
-                        var listener = new UdpClient(publicEndpoint.Port);
-                        while (isHolePunching)
+                        input = Interaction.InputBox(
+                            "Enter the other peer’s public endpoint (IP:Port), e.g. 203.0.113.78:47659",
+                            "Remote Peer Info"
+                        );
+                    }));
+
+                    if (string.IsNullOrWhiteSpace(input))
+                    {
+                        log("[ERROR] No remote endpoint provided.");
+                        return;
+                    }
+
+                    var parts = input.Trim().Split(':');
+                    if (parts.Length != 2 ||
+                        !IPAddress.TryParse(parts[0], out var remoteIP) ||
+                        !int.TryParse(parts[1], out var remotePort))
+                    {
+                        log("[ERROR] Invalid endpoint format.");
+                        return;
+                    }
+                    remotePublicEndpoint = new IPEndPoint(remoteIP, remotePort);
+
+                    // 4c) Perform UDP hole‐punching
+                    log($"Punching UDP to {remotePublicEndpoint.Address}:{remotePublicEndpoint.Port}…");
+                    isHolePunching = true;
+
+                    using (var puncher = new UdpClient(new IPEndPoint(IPAddress.Any, publicEndpoint.Port)))
+                    {
+                        // Listener to catch remote “HELLO!”
+                        var ctsListen = new CancellationTokenSource();
+                        Task.Run(() =>
                         {
-                            try
+                            var listener = new UdpClient(publicEndpoint.Port);
+                            while (isHolePunching)
                             {
-                                IPEndPoint ep = null!;
-                                var data = listener.Receive(ref ep);
-                                string txt = Encoding.UTF8.GetString(data);
-                                if (txt == "HELLO!")
+                                try
                                 {
-                                    lock (onlinePeers)
+                                    IPEndPoint ep = null!;
+                                    var data = listener.Receive(ref ep);
+                                    string txt = Encoding.UTF8.GetString(data);
+                                    if (txt == "HELLO!")
                                     {
-                                        onlinePeers.Add($"{startupUsername}_{ep.Address}");
+                                        lock (onlinePeers)
+                                        {
+                                            onlinePeers.Add($"{startupUsername}_{ep.Address}");
+                                        }
+                                        Invoke(new Action(UpdateOnlineCount));
+                                        break;
                                     }
-                                    Invoke(new Action(UpdateOnlineCount));
-                                    break;
+                                }
+                                catch
+                                {
+                                    // ignore
                                 }
                             }
-                            catch
-                            {
-                                // Ignore and keep waiting
-                            }
+                            listener.Close();
+                            ctsListen.Cancel();
+                        }, ctsListen.Token);
+
+                        // Send “HELLO!” packets for 5 seconds or until response
+                        var sw = Stopwatch.StartNew();
+                        while (sw.Elapsed < TimeSpan.FromSeconds(5) && !ctsListen.Token.IsCancellationRequested)
+                        {
+                            var hello = Encoding.UTF8.GetBytes("HELLO!");
+                            puncher.Send(hello, hello.Length, remotePublicEndpoint);
+                            await Task.Delay(200, ct);
                         }
-                        listener.Close();
-                        ctsListen.Cancel();
-                    }, ctsListen.Token);
-
-                    // Send “HELLO!” packets for up to 5 seconds
-                    var sw = Stopwatch.StartNew();
-                    while (sw.Elapsed < TimeSpan.FromSeconds(5) && !ctsListen.Token.IsCancellationRequested)
-                    {
-                        var hello = Encoding.UTF8.GetBytes("HELLO!");
-                        puncher.Send(hello, hello.Length, remotePublicEndpoint);
-                        await Task.Delay(200, ct);
+                        isHolePunching = false;
                     }
-                    isHolePunching = false;
-                }
 
-                if (onlinePeers.Count > 0)
-                {
-                    log("NAT hole‐punch succeeded—peer is online!");
+                    if (onlinePeers.Count > 0)
+                    {
+                        log("NAT hole‐punch succeeded—peer is online!");
+                    }
+                    else
+                    {
+                        log("[ERROR] Hole‐punching failed. Check NAT/firewall settings.");
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    log("[ERROR] Hole‐punching failed. Check NAT/firewall settings.");
+                    log($"[ERROR] NAT traversal error: {ex.Message}");
+                    return;
                 }
             }
-            catch (Exception ex)
+            else
             {
-                log($"[ERROR] NAT traversal error: {ex.Message}");
-                return;
+                log("NAT traversal already attempted—skipping second prompt.");
             }
 
             log("Ready!");
