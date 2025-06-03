@@ -132,18 +132,30 @@ namespace SecureNetProto
             txtConnectingLog.Clear();
             lblConnecting.Text = "Connecting…";
 
-            // 3) Initialize the CTS here (so it's never null)
+            // 3) Initialize the CTS here & reset NAT flag
             connectingCts = new CancellationTokenSource();
             natTraversalDone = false;
 
             try
             {
-                await ConnectFlow(connectingCts.Token);
+                bool success = await ConnectFlow(connectingCts.Token);
 
-                // 4) Only after ConnectFlow returns (including after the InputBox)
-                panelConnecting.Visible = false;
-                panelMain.Visible = true;
-                InitializeMainPanelAfterConnect();
+                if (success)
+                {
+                    // Only if ConnectFlow returned true do we move to the Main panel
+                    panelConnecting.Visible = false;
+                    panelMain.Visible = true;
+                    InitializeMainPanelAfterConnect();
+                }
+                else
+                {
+                    // ConnectFlow returned false → no peer online or user canceled
+                    txtConnectingLog.AppendText(Environment.NewLine +
+                        "⛔ No peer came online. Returning to startup." + Environment.NewLine);
+                    await Task.Delay(2000);
+                    panelConnecting.Visible = false;
+                    panelStartup.Visible = true;
+                }
             }
             catch (Exception ex)
             {
@@ -162,7 +174,13 @@ namespace SecureNetProto
             }
         }
 
-        private async Task ConnectFlow(CancellationToken ct)
+
+        /// <summary>
+        /// Runs the entire LAN‐discovery then (if needed) STUN + hole‐punch flow.
+        /// Returns true ONLY if at least one peer ended up “online” (either via LAN or NAT).
+        /// Returns false if we never found/connected to a peer (or the user cancelled).
+        /// </summary>
+        private async Task<bool> ConnectFlow(CancellationToken ct)
         {
             Action<string> log = msg => Invoke(new Action(() =>
             {
@@ -180,7 +198,7 @@ namespace SecureNetProto
             catch (Exception ex)
             {
                 log($"[ERROR] {ex.Message}");
-                return;
+                return false;
             }
 
             // 2) Save username to disk
@@ -194,7 +212,7 @@ namespace SecureNetProto
             catch (Exception ex)
             {
                 log($"[ERROR] Failed to write username file: {ex.Message}");
-                return;
+                return false;
             }
 
             // 3) Initialize network (placeholder)
@@ -206,7 +224,7 @@ namespace SecureNetProto
             catch (Exception ex)
             {
                 log($"[ERROR] Network init failed: {ex.Message}");
-                return;
+                return false;
             }
 
             // ── Attempt LAN discovery first ──
@@ -215,18 +233,19 @@ namespace SecureNetProto
                 log("Broadcasting presence (LAN)...");
                 StartBroadcasting();
                 StartListening();
-                await Task.Delay(2000, ct);
+                await Task.Delay(2000, ct);  // wait 2 seconds to see if any LAN peers respond
             }
             catch (Exception ex)
             {
                 log($"[ERROR] LAN broadcast error: {ex.Message}");
             }
 
+            // If any peer showed up on LAN, we're done
             if (onlinePeers.Count > 0)
             {
                 log($"Found {onlinePeers.Count} peer(s) on the same LAN.");
                 log("Ready!");
-                return;
+                return true;
             }
 
             // ── No LAN peers → do NAT traversal, but only once ──
@@ -259,16 +278,16 @@ namespace SecureNetProto
                     if (string.IsNullOrWhiteSpace(input))
                     {
                         log("[ERROR] No remote endpoint provided.");
-                        return;
+                        return false;
                     }
 
                     var parts = input.Trim().Split(':');
-                    if (parts.Length != 2 ||
-                        !IPAddress.TryParse(parts[0], out var remoteIP) ||
-                        !int.TryParse(parts[1], out var remotePort))
+                    if (parts.Length != 2
+                        || !IPAddress.TryParse(parts[0], out var remoteIP)
+                        || !int.TryParse(parts[1], out var remotePort))
                     {
                         log("[ERROR] Invalid endpoint format.");
-                        return;
+                        return false;
                     }
                     remotePublicEndpoint = new IPEndPoint(remoteIP, remotePort);
 
@@ -311,7 +330,8 @@ namespace SecureNetProto
 
                         // Send “HELLO!” packets for 5 seconds or until response
                         var sw = Stopwatch.StartNew();
-                        while (sw.Elapsed < TimeSpan.FromSeconds(5) && !ctsListen.Token.IsCancellationRequested)
+                        while (sw.Elapsed < TimeSpan.FromSeconds(5)
+                               && !ctsListen.Token.IsCancellationRequested)
                         {
                             var hello = Encoding.UTF8.GetBytes("HELLO!");
                             puncher.Send(hello, hello.Length, remotePublicEndpoint);
@@ -320,19 +340,23 @@ namespace SecureNetProto
                         isHolePunching = false;
                     }
 
+                    // Check if hole‐punch succeeded
                     if (onlinePeers.Count > 0)
                     {
                         log("NAT hole‐punch succeeded—peer is online!");
+                        log("Ready!");
+                        return true;
                     }
                     else
                     {
                         log("[ERROR] Hole‐punching failed. Check NAT/firewall settings.");
+                        return false;
                     }
                 }
                 catch (Exception ex)
                 {
                     log($"[ERROR] NAT traversal error: {ex.Message}");
-                    return;
+                    return false;
                 }
             }
             else
@@ -340,7 +364,9 @@ namespace SecureNetProto
                 log("NAT traversal already attempted—skipping second prompt.");
             }
 
-            log("Ready!");
+            // If we reach here and still have no peers, fail
+            log("No peers ever came online.");
+            return false;
         }
 
         // ───────────── Initialize Main Panel ─────────────
