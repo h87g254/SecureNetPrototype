@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -11,8 +11,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Timers;
 using System.Windows.Forms;
-using STUN;                          // moien007’s STUN library
-using Microsoft.VisualBasic;        // for Interaction.InputBox
 
 namespace SecureNetProto
 {
@@ -38,12 +36,6 @@ namespace SecureNetProto
         private List<SharedFileInfo> mySharedFiles = new List<SharedFileInfo>();
         private Dictionary<string, List<SharedFileInfo>> remoteFiles = new Dictionary<string, List<SharedFileInfo>>();
         private Dictionary<int, (string Owner, string FileName)> contentIndex = new();
-
-        // ─── New NAT‐Traversal Fields ───
-        private IPEndPoint publicEndpoint;        // our discovered external IP:port
-        private IPEndPoint remotePublicEndpoint;  // other peer’s public IP:port
-        private bool isHolePunching = false;
-        private bool natTraversalDone = false;
 
         // ───────────── Constructor ─────────────
 
@@ -132,9 +124,8 @@ namespace SecureNetProto
             txtConnectingLog.Clear();
             lblConnecting.Text = "Connecting…";
 
-            // 3) Initialize the CTS here & reset NAT flag
+            // 3) Initialize the CTS here
             connectingCts = new CancellationTokenSource();
-            natTraversalDone = false;
 
             try
             {
@@ -174,11 +165,9 @@ namespace SecureNetProto
             }
         }
 
-
         /// <summary>
-        /// Runs the entire LAN‐discovery then (if needed) STUN + hole‐punch flow.
-        /// Returns true ONLY if at least one peer ended up “online” (either via LAN or NAT).
-        /// Returns false if we never found/connected to a peer (or the user cancelled).
+        /// Runs the LAN‐only discovery. Returns true ONLY if at least one peer is found on LAN.
+        /// Returns false if no LAN peer is found (or the user canceled).
         /// </summary>
         private async Task<bool> ConnectFlow(CancellationToken ct)
         {
@@ -227,7 +216,7 @@ namespace SecureNetProto
                 return false;
             }
 
-            // ── Attempt LAN discovery first ──
+            // ── Attempt LAN discovery only ──
             try
             {
                 log("Broadcasting presence (LAN)...");
@@ -248,124 +237,8 @@ namespace SecureNetProto
                 return true;
             }
 
-            // ── No LAN peers → do NAT traversal, but only once ──
-            if (!natTraversalDone)
-            {
-                natTraversalDone = true;
-                log("No LAN peers. Switching to NAT traversal…");
-
-                try
-                {
-                    // 4a) Discover public endpoint via STUN
-                    log("Discovering public endpoint via STUN...");
-                    publicEndpoint = DiscoverPublicEndpoint();
-                    log($"Your public endpoint: {publicEndpoint.Address}:{publicEndpoint.Port}");
-
-                    // Copy to clipboard
-                    Clipboard.SetText($"{publicEndpoint.Address}:{publicEndpoint.Port}");
-                    log("Public endpoint copied to clipboard. Share it with your peer.");
-
-                    // 4b) Prompt user for remote peer’s endpoint
-                    string input = "";
-                    Invoke(new Action(() =>
-                    {
-                        input = Interaction.InputBox(
-                            "Enter the other peer’s public endpoint (IP:Port), e.g. 203.0.113.78:47659",
-                            "Remote Peer Info"
-                        );
-                    }));
-
-                    if (string.IsNullOrWhiteSpace(input))
-                    {
-                        log("[ERROR] No remote endpoint provided.");
-                        return false;
-                    }
-
-                    var parts = input.Trim().Split(':');
-                    if (parts.Length != 2
-                        || !IPAddress.TryParse(parts[0], out var remoteIP)
-                        || !int.TryParse(parts[1], out var remotePort))
-                    {
-                        log("[ERROR] Invalid endpoint format.");
-                        return false;
-                    }
-                    remotePublicEndpoint = new IPEndPoint(remoteIP, remotePort);
-
-                    // 4c) Perform UDP hole‐punching
-                    log($"Punching UDP to {remotePublicEndpoint.Address}:{remotePublicEndpoint.Port}…");
-                    isHolePunching = true;
-
-                    using (var puncher = new UdpClient(new IPEndPoint(IPAddress.Any, publicEndpoint.Port)))
-                    {
-                        // Listener to catch remote “HELLO!”
-                        var ctsListen = new CancellationTokenSource();
-                        Task.Run(() =>
-                        {
-                            var listener = new UdpClient(publicEndpoint.Port);
-                            while (isHolePunching)
-                            {
-                                try
-                                {
-                                    IPEndPoint ep = null!;
-                                    var data = listener.Receive(ref ep);
-                                    string txt = Encoding.UTF8.GetString(data);
-                                    if (txt == "HELLO!")
-                                    {
-                                        lock (onlinePeers)
-                                        {
-                                            onlinePeers.Add($"{startupUsername}_{ep.Address}");
-                                        }
-                                        Invoke(new Action(UpdateOnlineCount));
-                                        break;
-                                    }
-                                }
-                                catch
-                                {
-                                    // ignore
-                                }
-                            }
-                            listener.Close();
-                            ctsListen.Cancel();
-                        }, ctsListen.Token);
-
-                        // Send “HELLO!” packets for 5 seconds or until response
-                        var sw = Stopwatch.StartNew();
-                        while (sw.Elapsed < TimeSpan.FromSeconds(5)
-                               && !ctsListen.Token.IsCancellationRequested)
-                        {
-                            var hello = Encoding.UTF8.GetBytes("HELLO!");
-                            puncher.Send(hello, hello.Length, remotePublicEndpoint);
-                            await Task.Delay(200, ct);
-                        }
-                        isHolePunching = false;
-                    }
-
-                    // Check if hole‐punch succeeded
-                    if (onlinePeers.Count > 0)
-                    {
-                        log("NAT hole‐punch succeeded—peer is online!");
-                        log("Ready!");
-                        return true;
-                    }
-                    else
-                    {
-                        log("[ERROR] Hole‐punching failed. Check NAT/firewall settings.");
-                        return false;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    log($"[ERROR] NAT traversal error: {ex.Message}");
-                    return false;
-                }
-            }
-            else
-            {
-                log("NAT traversal already attempted—skipping second prompt.");
-            }
-
-            // If we reach here and still have no peers, fail
-            log("No peers ever came online.");
+            // No LAN peers → fail immediately
+            log("No LAN peers found.");
             return false;
         }
 
@@ -777,36 +650,6 @@ namespace SecureNetProto
                     MessageBox.Show($"Downloaded to Downloads\\{fileName}!", "Download Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }));
             });
-        }
-
-        // ───────────── Helper: STUN Discovery ─────────────
-
-        private IPEndPoint DiscoverPublicEndpoint()
-        {
-            // 1) Bind a raw UDP socket to an ephemeral local port (NAT will assign a public port)
-            using var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            sock.Bind(new IPEndPoint(IPAddress.Any, 0));
-
-            // 2) Resolve a STUN server hostname (Google’s public STUN on port 19302)
-            var stunServerIPs = Dns.GetHostEntry("stun.l.google.com")
-                                   .AddressList
-                                   .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork)
-                                   .ToList();
-            if (!stunServerIPs.Any())
-                throw new Exception("Could not resolve STUN server host.");
-
-            var stunServerEP = new IPEndPoint(stunServerIPs.First(), 19302);
-
-            // 3) Query the STUN server. 
-            //    STUNClient.Query(IPEndPoint server, STUNQueryType type, bool randomize) 
-            //    returns a STUNQueryResult, whose PublicEndPoint is the mapped (public) IP:port.
-            STUNQueryResult result = STUNClient.Query(stunServerEP, STUNQueryType.OpenNAT, true);
-
-            if (result == null || result.PublicEndPoint == null)
-                throw new Exception("STUN discovery failed (no response or NAT blocked).");
-
-            // 4) Return the discovered public endpoint (IP:port)
-            return result.PublicEndPoint;
         }
     }
 }
