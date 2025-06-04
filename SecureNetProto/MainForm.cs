@@ -37,6 +37,9 @@ namespace SecureNetProto
         private Dictionary<string, List<SharedFileInfo>> remoteFiles = new Dictionary<string, List<SharedFileInfo>>();
         private Dictionary<int, (string Owner, string FileName)> contentIndex = new();
 
+        // ─── New “Main Peer” Flag ───
+        private bool isMainPeer = false;
+
         // ───────────── Constructor ─────────────
 
         public MainForm()
@@ -126,6 +129,7 @@ namespace SecureNetProto
 
             // 3) Initialize the CTS here
             connectingCts = new CancellationTokenSource();
+            isMainPeer = false;  // reset flag on each connect attempt
 
             try
             {
@@ -140,9 +144,11 @@ namespace SecureNetProto
                 }
                 else
                 {
-                    // ConnectFlow returned false → no peer online or user canceled
+                    // (In this modified version, ConnectFlow never actually returns false
+                    //  unless the user cancels or an error occurs. We only return false on
+                    //  catastrophic failure—otherwise, if no peers are found, we become main peer.)
                     txtConnectingLog.AppendText(Environment.NewLine +
-                        "⛔ No peer came online. Returning to startup." + Environment.NewLine);
+                        "⛔ Connection failed. Returning to startup." + Environment.NewLine);
                     await Task.Delay(2000);
                     panelConnecting.Visible = false;
                     panelStartup.Visible = true;
@@ -166,8 +172,10 @@ namespace SecureNetProto
         }
 
         /// <summary>
-        /// Runs the LAN‐only discovery. Returns true ONLY if at least one peer is found on LAN.
-        /// Returns false if no LAN peer is found (or the user canceled).
+        /// Runs the LAN‐only discovery. 
+        /// If at least one peer is found, we return true. 
+        /// If none are found, we mark ourselves as the “main peer” and still return true.
+        /// Only returns false if the user cancels or a non‐recoverable error occurs.
         /// </summary>
         private async Task<bool> ConnectFlow(CancellationToken ct)
         {
@@ -229,7 +237,7 @@ namespace SecureNetProto
                 log($"[ERROR] LAN broadcast error: {ex.Message}");
             }
 
-            // If any peer showed up on LAN, we're done
+            // If any peer showed up on LAN, proceed as usual
             if (onlinePeers.Count > 0)
             {
                 log($"Found {onlinePeers.Count} peer(s) on the same LAN.");
@@ -237,9 +245,11 @@ namespace SecureNetProto
                 return true;
             }
 
-            // No LAN peers → fail immediately
-            log("No LAN peers found.");
-            return false;
+            // No LAN peers → become “main peer”
+            isMainPeer = true;
+            log("No LAN peers found. You are now the MAIN PEER.");
+            log("Ready!");
+            return true;
         }
 
         // ───────────── Initialize Main Panel ─────────────
@@ -247,13 +257,16 @@ namespace SecureNetProto
         private void InitializeMainPanelAfterConnect()
         {
             lblAppTitle.Text = "SecureNet 🕸️";
-            lblSubtitle.Text = "Connect. Share. Stay private. Prototype Edition.";
+            lblSubtitle.Text = isMainPeer
+                ? "Role: MAIN PEER — waiting for others to join."
+                : "Connect. Share. Stay private. Prototype Edition.";
             lblUsername.Text = $"Username: {startupUsername}";
             lblUsersOnline.Text = $"Users online: {onlinePeers.Count + 1}";
 
             panelMain.Visible = true;
             this.AcceptButton = btnShare;
 
+            // Continue broadcasting/listening so that any new peers will discover us
             StartBroadcasting();
             StartListening();
             StartFileServer();
