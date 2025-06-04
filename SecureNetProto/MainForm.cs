@@ -37,7 +37,7 @@ namespace SecureNetProto
         private Dictionary<string, List<SharedFileInfo>> remoteFiles = new Dictionary<string, List<SharedFileInfo>>();
         private Dictionary<int, (string Owner, string FileName)> contentIndex = new();
 
-        // ─── New “Main Peer” Flag ───
+        // ─── “Main Peer” Flag ───
         private bool isMainPeer = false;
 
         // ───────────── Constructor ─────────────
@@ -144,9 +144,7 @@ namespace SecureNetProto
                 }
                 else
                 {
-                    // (In this modified version, ConnectFlow never actually returns false
-                    //  unless the user cancels or an error occurs. We only return false on
-                    //  catastrophic failure—otherwise, if no peers are found, we become main peer.)
+                    // ConnectFlow only returns false on unrecoverable error
                     txtConnectingLog.AppendText(Environment.NewLine +
                         "⛔ Connection failed. Returning to startup." + Environment.NewLine);
                     await Task.Delay(2000);
@@ -173,9 +171,9 @@ namespace SecureNetProto
 
         /// <summary>
         /// Runs the LAN‐only discovery. 
-        /// If at least one peer is found, we return true. 
-        /// If none are found, we mark ourselves as the “main peer” and still return true.
-        /// Only returns false if the user cancels or a non‐recoverable error occurs.
+        /// If at least one peer is found, returns true. 
+        /// If none are found, sets isMainPeer = true and still returns true.
+        /// Only returns false on unrecoverable error.
         /// </summary>
         private async Task<bool> ConnectFlow(CancellationToken ct)
         {
@@ -237,7 +235,7 @@ namespace SecureNetProto
                 log($"[ERROR] LAN broadcast error: {ex.Message}");
             }
 
-            // If any peer showed up on LAN, proceed as usual
+            // If any peer showed up on LAN, proceed as normal
             if (onlinePeers.Count > 0)
             {
                 log($"Found {onlinePeers.Count} peer(s) on the same LAN.");
@@ -266,7 +264,7 @@ namespace SecureNetProto
             panelMain.Visible = true;
             this.AcceptButton = btnShare;
 
-            // Continue broadcasting/listening so that any new peers will discover us
+            // Keep broadcasting/listening in case new peers join
             StartBroadcasting();
             StartListening();
             StartFileServer();
@@ -362,6 +360,7 @@ namespace SecureNetProto
 
                         if (message.StartsWith("files:"))
                         {
+                            // ── “files:” broadcast ──
                             var parts = message.Split(':', 3);
                             if (parts.Length == 3)
                             {
@@ -369,12 +368,21 @@ namespace SecureNetProto
                                 if (sender == GetLocalIdentifier())
                                     continue;
 
+                                // 1) Add sender to onlinePeers (if not already present)
+                                lock (onlinePeers)
+                                {
+                                    if (onlinePeers.Add(sender))
+                                        UpdateOnlineCount();
+                                }
+
+                                // 2) Update remoteFiles dictionary and UI
                                 var files = JsonSerializer.Deserialize<List<SharedFileInfo>>(parts[2]);
                                 UpdateRemoteFiles(sender, files);
                             }
                         }
                         else
                         {
+                            // ── plain identifier broadcast ──
                             string id = message;
                             if (id == GetLocalIdentifier())
                                 continue;
@@ -382,15 +390,13 @@ namespace SecureNetProto
                             lock (onlinePeers)
                             {
                                 if (onlinePeers.Add(id))
-                                {
                                     UpdateOnlineCount();
-                                }
                             }
                         }
                     }
                     catch
                     {
-                        // ignore
+                        // ignore any socket errors
                     }
                 }
             });
